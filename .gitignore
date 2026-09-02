@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.uv-cache/
+venv/
+
+# Build artifacts
+.build-venv/
+.build-cache/
+release/
+dist/
+build/
+*.spec
+*.zip
+
+# Local data and secrets
+.env
+config.json
+.data/
+*.session
+*.session-journal
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
