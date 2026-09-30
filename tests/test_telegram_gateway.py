@@ -70,6 +70,10 @@ class TelegramGatewayTests(unittest.TestCase):
         )
         self.assertTrue(TelegramGateway._is_like_missing(message))
 
+    def test_detects_missing_comment_message(self):
+        message = HistoryMessage(21, "Ошибка! Ваш комментарий не найден.")
+        self.assertTrue(TelegramGateway._is_like_missing(message))
+
 
 class TelegramGatewayAsyncTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod

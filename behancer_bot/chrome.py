@@ -17,6 +17,7 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.webdriver import WebDriver as ChromeWebDriver
 from selenium.webdriver.common.action_chains import ActionChains
@@ -24,6 +25,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from .comments import pick_comment
 from .config import DATA_DIR, AppConfig
 from .control import RunControl
 from .links import expand_redirect_url, is_behance_project
@@ -194,6 +196,12 @@ class ChromeController:
         return self.config.chrome_debug_port + offset
 
     def perform_task(self, urls: Iterable[str]) -> bool:
+        return self._perform_on_project(urls, action="like")
+
+    def perform_comment_task(self, urls: Iterable[str]) -> bool:
+        return self._perform_on_project(urls, action="comment")
+
+    def _perform_on_project(self, urls: Iterable[str], action: str) -> bool:
         if self.driver is None:
             raise RuntimeError("Chrome не запущен")
         for url in urls:
@@ -208,10 +216,18 @@ class ChromeController:
                     self.log("Открыта страница Behance, но это не проект")
                     continue
                 delay = random.uniform(18, 25)
-                self.log(f"Проект открыт. Ожидание перед лайком: {delay:.0f} сек.")
-                self.control.sleep(delay)
-                if self._appreciate():
-                    return True
+                if action == "comment":
+                    self.log(
+                        f"Проект открыт. Ожидание перед комментарием: {delay:.0f} сек."
+                    )
+                    self.control.sleep(delay)
+                    if self._post_comment():
+                        return True
+                else:
+                    self.log(f"Проект открыт. Ожидание перед лайком: {delay:.0f} сек.")
+                    self.control.sleep(delay)
+                    if self._appreciate():
+                        return True
             except TimeoutException:
                 self.log(f"Страница не загрузилась вовремя: {url}")
             except WebDriverException as exc:
@@ -505,6 +521,533 @@ class ChromeController:
                 else None
             )
         return None
+
+    def _post_comment(self) -> bool:
+        assert self.driver is not None
+        self.driver.switch_to.default_content()
+        field = self._wait_for_comment_field()
+        comment = pick_comment()
+        self.log(f"Выбран комментарий: {comment}")
+        if not self._fill_comment_field(field, comment):
+            self.log("Не удалось ввести текст комментария")
+            return False
+        self.control.sleep(0.6)
+        if not self._submit_comment(field, comment):
+            self.log("Комментарий введён, но кнопка отправки его не опубликовала")
+            return False
+        if self._wait_until_comment_visible(comment, field):
+            self.log("Комментарий опубликован")
+            return True
+        self.log("Комментарий не появился на странице проекта")
+        return False
+
+    def _wait_for_comment_field(self) -> object:
+        """Reload the project until the comment box is actually visible."""
+        attempt = 1
+        while True:
+            self.control.checkpoint()
+            field = self._locate_comment_field()
+            if field is not None:
+                return field
+            self.log(
+                "Комментарии не отображаются — обновляю страницу "
+                f"(попытка {attempt})"
+            )
+            self._reload_page()
+            attempt += 1
+
+    def _locate_comment_field(self) -> object | None:
+        self._scroll_to_comments()
+        field = self._find_comment_field()
+        if field is None and self._click_comments_opener():
+            self.control.sleep(1.5)
+            field = self._find_comment_field()
+        return field
+
+    def _reload_page(self) -> None:
+        assert self.driver is not None
+        self.control.checkpoint()
+        self.driver.switch_to.default_content()
+        self.driver.refresh()
+        WebDriverWait(self.driver, 30).until(
+            lambda driver: driver.execute_script("return document.readyState")
+            in ("interactive", "complete")
+        )
+        self.control.sleep(1)
+
+    def _scroll_to_comments(self) -> None:
+        assert self.driver is not None
+        self.driver.execute_script(
+            """
+            const height = Math.max(
+              document.body ? document.body.scrollHeight : 0,
+              document.documentElement ? document.documentElement.scrollHeight : 0
+            );
+            window.scrollTo(0, height);
+            """
+        )
+        self.control.sleep(1)
+
+    def _click_comments_opener(self) -> bool:
+        assert self.driver is not None
+        clicked = bool(
+            self.driver.execute_script(
+                """
+                const labelOf = (el) => [
+                  el.innerText, el.getAttribute('aria-label'), el.getAttribute('title')
+                ].filter(Boolean).join(' ');
+                const opener = [...document.querySelectorAll('button,[role="button"],a')]
+                  .find(el => {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) return false;
+                    const label = labelOf(el);
+                    return /\\bcomments?\\b|комментар/i.test(label) &&
+                      !/add a comment|leave a comment|напишите|добавить комментарий/i.test(label);
+                  });
+                if (!opener) return false;
+                opener.click();
+                return true;
+                """
+            )
+        )
+        if clicked:
+            self.log("Открываю блок комментариев")
+        return clicked
+
+    def _find_comment_field(self) -> object | None:
+        assert self.driver is not None
+        self.driver.switch_to.default_content()
+        field = self._find_comment_field_here()
+        if field is not None:
+            return field
+        for frame in self.driver.find_elements(By.CSS_SELECTOR, "iframe"):
+            try:
+                self.driver.switch_to.default_content()
+                self.driver.switch_to.frame(frame)
+            except WebDriverException:
+                continue
+            field = self._find_comment_field_here()
+            if field is not None:
+                return field
+        self.driver.switch_to.default_content()
+        return None
+
+    def _find_comment_field_here(self) -> object | None:
+        assert self.driver is not None
+        field = self._find_known_comment_field()
+        if field is not None:
+            self.log("Найдено поле комментария Behance")
+            return field
+        try:
+            return self.driver.execute_script(
+                """
+                const all = [];
+                const visit = (root) => {
+                  if (!root || !root.querySelectorAll) return;
+                  all.push(...root.querySelectorAll(
+                    'textarea, input[type="text"], [contenteditable="true"]'
+                  ));
+                  for (const el of root.querySelectorAll('*')) {
+                    if (el.shadowRoot) visit(el.shadowRoot);
+                  }
+                };
+                visit(document);
+                const blob = (el) => [
+                  el.placeholder, el.getAttribute('aria-label'),
+                  el.getAttribute('data-placeholder'),
+                  el.getAttribute('aria-placeholder'), el.innerText,
+                  el.name, el.id, el.className
+                ].filter(Boolean).join(' ');
+                const visible = (el) => {
+                  const rect = el.getBoundingClientRect();
+                  const style = getComputedStyle(el);
+                  return rect.width > 20 && rect.height > 8 &&
+                    style.visibility !== 'hidden' && style.display !== 'none';
+                };
+                const inComments = (el) => {
+                  let node = el;
+                  for (let depth = 0; depth < 8 && node; depth += 1) {
+                    const marker = [
+                      node.id, node.className, node.getAttribute?.('aria-label')
+                    ].filter(Boolean).join(' ');
+                    if (/comment|коммент/i.test(marker)) return true;
+                    node = node.parentElement;
+                  }
+                  return false;
+                };
+                const ranked = all.map(el => {
+                  const text = blob(el);
+                  let score = 0;
+                  if (/comment|коммент|отзыв|feedback/i.test(text)) score += 20;
+                  if (inComments(el)) score += 15;
+                  if (visible(el)) score += 8;
+                  if (el.tagName === 'TEXTAREA' || el.isContentEditable) score += 3;
+                  if (/search|поиск|email|password|пароль/i.test(text)) score -= 40;
+                  return [score, el];
+                }).filter(pair => pair[0] >= 20).sort((a, b) => b[0] - a[0]);
+                if (!ranked.length) return null;
+                ranked[0][1].scrollIntoView({block: 'center'});
+                return ranked[0][1];
+                """
+            )
+        except JavascriptException:
+            return None
+
+    def _find_known_comment_field(self) -> object | None:
+        """Find the Behance project comment box by its stable class prefixes."""
+        assert self.driver is not None
+        selector = (
+            "textarea[class*='ProjectCommentInput-commentTextArea'], "
+            "textarea[class*='TextArea-textarea']"
+        )
+        try:
+            WebDriverWait(self.driver, 6).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            )
+        except TimeoutException:
+            return None
+        field = self._prefer_comment_field(
+            self.driver.find_elements(By.CSS_SELECTOR, selector)
+        )
+        if field is None:
+            return None
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", field
+            )
+        except JavascriptException:
+            pass
+        return field
+
+    @staticmethod
+    def _prefer_comment_field(elements: list[object]) -> object | None:
+        def score(element: object) -> int:
+            classes = element.get_attribute("class") or ""
+            if "ProjectCommentInput-commentTextArea" in classes:
+                return 2
+            if "TextArea-textarea" in classes:
+                return 1
+            return 0
+
+        visible: list[object] = []
+        for element in elements:
+            try:
+                if score(element) and element.is_displayed():
+                    visible.append(element)
+            except WebDriverException:
+                continue
+        if not visible:
+            return None
+        field = max(visible, key=score)
+        return field
+
+    def _fill_comment_field(self, element: object, text: str) -> bool:
+        assert self.driver is not None
+        try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'}); arguments[0].focus();",
+                element,
+            )
+        except JavascriptException:
+            pass
+        self._click_element(element)
+        self.control.sleep(0.3)
+        try:
+            element.send_keys(Keys.CONTROL, "a")
+            element.send_keys(Keys.DELETE)
+            element.send_keys(text)
+        except WebDriverException:
+            pass
+        self._notify_comment_input(element, text)
+        return text in self._field_text(element)
+
+    def _field_text(self, element: object) -> str:
+        assert self.driver is not None
+        try:
+            return (
+                self.driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    if (!el) return '';
+                    if (el.isContentEditable) {
+                      return (el.innerText || el.textContent || '').trim();
+                    }
+                    return (el.value || '').trim();
+                    """,
+                    element,
+                )
+                or ""
+            )
+        except (JavascriptException, WebDriverException):
+            return ""
+
+    def _notify_comment_input(self, element: object, text: str) -> None:
+        """Tell React the textarea changed so the Post button becomes active."""
+        assert self.driver is not None
+        try:
+            self.driver.execute_script(
+                """
+                const el = arguments[0];
+                const value = arguments[1];
+                el.focus();
+                const proto = el.tagName === 'TEXTAREA'
+                  ? HTMLTextAreaElement.prototype
+                  : HTMLInputElement.prototype;
+                const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (descriptor && descriptor.set) descriptor.set.call(el, value);
+                else el.value = value;
+                el.dispatchEvent(new InputEvent('input', {
+                  bubbles: true,
+                  cancelable: true,
+                  data: value,
+                  inputType: 'insertFromPaste'
+                }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                """,
+                element,
+                text,
+            )
+        except JavascriptException:
+            return
+
+    def _submit_comment(self, field: object, text: str) -> bool:
+        assert self.driver is not None
+        for attempt in range(1, 4):
+            self.control.checkpoint()
+            self._notify_comment_input(field, text)
+            button = self._find_comment_submit_button(field)
+            if button is None:
+                self.log(
+                    f"Кнопка отправки внутри блока комментария не найдена "
+                    f"({attempt}/3)"
+                )
+                self.control.sleep(0.6)
+                continue
+            self._wait_until_comment_button_enabled(button)
+            if self._comment_button_disabled(button):
+                self.log(f"Кнопка отправки ещё неактивна ({attempt}/3)")
+                self.control.sleep(0.6)
+                continue
+            label = self._button_label(button)
+            self.log(f"Нажимаю кнопку «{label or 'Post a Comment'}»")
+            self._click_post_comment_button(button)
+            self._request_comment_form_submit(field)
+            self.control.sleep(0.8)
+            if self._comment_left_field(field, text):
+                return True
+            self.log("Текст остался в поле — повторяю отправку")
+        return False
+
+    def _find_comment_submit_button(self, field: object) -> object | None:
+        assert self.driver is not None
+        try:
+            return self.driver.execute_script(
+                """
+                const field = arguments[0];
+                const hasPrefix = (el, prefix) => [...el.classList].some(name =>
+                  name === prefix || name.startsWith(prefix + '-')
+                );
+                const isCommentButton = (button) => {
+                  if (
+                    !hasPrefix(button, 'Btn-button') ||
+                    !hasPrefix(button, 'Btn-base') ||
+                    !hasPrefix(button, 'Btn-normal')
+                  ) {
+                    return false;
+                  }
+                  const label = [
+                    button.innerText, button.getAttribute('aria-label'), button.className
+                  ].join(' ');
+                  return !/appreciate|оценить|\\blike\\b|лайк/i.test(label);
+                };
+                const textOf = (el) => (el.innerText || el.textContent || '')
+                  .replace(/\\s+/g, ' ')
+                  .trim();
+                const postButton = [...document.querySelectorAll('button')]
+                  .find(button => /post a comment/i.test(textOf(button)));
+                if (postButton) {
+                  postButton.scrollIntoView({block: 'center'});
+                  return postButton;
+                }
+                let composer = null;
+                let node = field.parentElement;
+                for (let depth = 0; depth < 12 && node; depth += 1) {
+                  if (/ProjectComment/i.test(String(node.className || ''))) composer = node;
+                  node = node.parentElement;
+                }
+                composer = composer || field.closest('form') || document.body;
+                const buttons = [...composer.querySelectorAll('button')]
+                  .filter(isCommentButton);
+                return buttons.find(button => /post|опублик|отправ/i.test(textOf(button)))
+                  || buttons[buttons.length - 1]
+                  || null;
+                """,
+                field,
+            )
+        except JavascriptException:
+            return None
+
+    def _button_label(self, button: object) -> str:
+        assert self.driver is not None
+        try:
+            return (
+                self.driver.execute_script(
+                    """
+                    const button = arguments[0];
+                    return (button.innerText || button.textContent || '')
+                      .replace(/\\s+/g, ' ')
+                      .trim();
+                    """,
+                    button,
+                )
+                or ""
+            )
+        except JavascriptException:
+            return ""
+
+    def _click_post_comment_button(self, button: object) -> None:
+        assert self.driver is not None
+        try:
+            self.driver.execute_script(
+                """
+                const button = arguments[0];
+                button.scrollIntoView({block: 'center'});
+                const label = button.querySelector('[class*="Btn-label"]') || button;
+                for (const target of [label, button]) {
+                  target.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+                  target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                  target.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
+                  target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                  target.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                }
+                """,
+                button,
+            )
+        except JavascriptException:
+            pass
+        self._click_element(button)
+
+    def _comment_button_disabled(self, button: object) -> bool:
+        assert self.driver is not None
+        try:
+            return bool(
+                self.driver.execute_script(
+                    """
+                    const button = arguments[0];
+                    return Boolean(
+                      button.disabled || button.getAttribute('aria-disabled') === 'true'
+                    );
+                    """,
+                    button,
+                )
+            )
+        except JavascriptException:
+            return False
+
+    def _request_comment_form_submit(self, field: object) -> None:
+        assert self.driver is not None
+        try:
+            self.driver.execute_script(
+                """
+                const field = arguments[0];
+                const form = field.closest('form');
+                if (!form || typeof form.requestSubmit !== 'function') return;
+                const submitter = [...form.querySelectorAll('button, [type="submit"]')]
+                  .find(button => !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+                if (submitter) form.requestSubmit(submitter);
+                else form.requestSubmit();
+                """,
+                field,
+            )
+        except JavascriptException:
+            return
+
+    def _comment_left_field(self, field: object, text: str) -> bool:
+        return text not in self._field_text(field)
+
+    def _wait_until_comment_button_enabled(self, button: object) -> None:
+        assert self.driver is not None
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            self.control.checkpoint()
+            try:
+                disabled = bool(
+                    self.driver.execute_script(
+                        """
+                        const button = arguments[0];
+                        return Boolean(
+                          button.disabled || button.getAttribute('aria-disabled') === 'true'
+                        );
+                        """,
+                        button,
+                    )
+                )
+            except JavascriptException:
+                return
+            if not disabled:
+                return
+            self.control.sleep(0.25)
+
+    def _wait_until_comment_visible(self, comment: str, field: object) -> bool:
+        assert self.driver is not None
+        deadline = time.monotonic() + 8
+        retry_after = time.monotonic() + 2
+        retried_submit = False
+        saw_text_in_field = False
+        empty_since: float | None = None
+        while time.monotonic() < deadline:
+            self.control.checkpoint()
+            presence = self._comment_presence(comment, field)
+            page_count = presence["page_count"]
+            field_count = presence["field_count"]
+            if field_count > 0:
+                saw_text_in_field = True
+                empty_since = None
+            elif page_count >= 1:
+                return True
+            elif saw_text_in_field:
+                if empty_since is None:
+                    empty_since = time.monotonic()
+                elif time.monotonic() - empty_since >= 1.5:
+                    self.log("Поле комментария очистилось после отправки")
+                    return True
+            if (
+                not retried_submit
+                and field_count > 0
+                and time.monotonic() >= retry_after
+            ):
+                self._submit_comment(field, comment)
+                retried_submit = True
+            self.control.sleep(0.5)
+        return False
+
+    def _comment_presence(self, comment: str, field: object) -> dict[str, int]:
+        assert self.driver is not None
+        try:
+            raw = self.driver.execute_script(
+                """
+                const text = arguments[0];
+                const field = arguments[1];
+                const fieldText = !field ? '' : (
+                  field.isContentEditable
+                    ? (field.innerText || field.textContent || '')
+                    : (field.value || '')
+                );
+                const page = document.body ? (document.body.innerText || '') : '';
+                const count = (source) => source.split(text).length - 1;
+                return {pageCount: count(page), fieldCount: count(fieldText)};
+                """,
+                comment,
+                field,
+            )
+        except (JavascriptException, WebDriverException):
+            return {"page_count": 0, "field_count": 1}
+        if not isinstance(raw, dict):
+            return {"page_count": 0, "field_count": 1}
+        return {
+            "page_count": int(raw.get("pageCount") or 0),
+            "field_count": int(raw.get("fieldCount") or 0),
+        }
 
     def _appreciate(self) -> bool:
         assert self.driver is not None

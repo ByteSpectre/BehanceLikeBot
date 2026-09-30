@@ -8,6 +8,7 @@ from .chrome import ChromeController
 from .config import AppConfig
 from .control import RunControl, SkipRequested, StopRequested
 from .links import is_facebook_url
+from .tasks import COMMENT_TASK, classify_task
 from .telegram_gateway import TelegramGateway
 
 LogFn = Callable[[str], None]
@@ -100,25 +101,39 @@ class BotWorker:
 
                 urls = telegram.message_urls(current_message)
                 facebook_urls = [url for url in urls if is_facebook_url(url)]
+                task_kind = classify_task(getattr(current_message, "raw_text", "") or "")
                 await telegram.mark_seen(current_message)
+                kind_label = "комментарий" if task_kind == COMMENT_TASK else "лайк"
                 self.log(
-                    f"Обработка задания #{current_message.id}: найдено ссылок — "
-                    f"{len(urls)}"
+                    f"Обработка задания #{current_message.id}: {kind_label}, "
+                    f"найдено ссылок — {len(urls)}"
                 )
-                if facebook_urls:
+                if task_kind == COMMENT_TASK and facebook_urls:
                     self.log(
-                        "Задание ведёт на Facebook — автоматически пропускаю "
-                        "его без открытия Chrome"
+                        "Задание на комментарий ссылается на пост Facebook — "
+                        "открою его и найду проект Behance"
+                    )
+                elif facebook_urls:
+                    self.log(
+                        "Задание на лайк ведёт на Facebook — автоматически "
+                        "пропускаю его без открытия Chrome"
                     )
                 try:
-                    if facebook_urls:
+                    if task_kind != COMMENT_TASK and facebook_urls:
                         completed = False
                     elif urls:
                         if not chrome_started:
                             await asyncio.to_thread(chrome.start)
                             chrome_started = True
                         self.event("state", "Работает")
-                        completed = await asyncio.to_thread(chrome.perform_task, urls)
+                        if task_kind == COMMENT_TASK:
+                            completed = await asyncio.to_thread(
+                                chrome.perform_comment_task, urls
+                            )
+                        else:
+                            completed = await asyncio.to_thread(
+                                chrome.perform_task, urls
+                            )
                     else:
                         completed = False
                         self.log("В задании нет ссылок для обработки — пропускаю его")
@@ -139,10 +154,16 @@ class BotWorker:
                         current_message = None
                         continue
                     if done_status == telegram.DONE_LIKE_MISSING:
-                        self.log(
-                            "Бот не нашёл лайк или проект находится в теневом бане — "
-                            "пропускаю задание"
-                        )
+                        if task_kind == COMMENT_TASK:
+                            self.log(
+                                "Бот не нашёл комментарий или проект находится "
+                                "в теневом бане — пропускаю задание"
+                            )
+                        else:
+                            self.log(
+                                "Бот не нашёл лайк или проект находится в теневом "
+                                "бане — пропускаю задание"
+                            )
                         await telegram.mark_seen(verdict_message)
                         if await telegram.click_skip(verdict_message):
                             self.skipped_count += 1

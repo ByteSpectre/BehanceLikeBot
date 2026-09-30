@@ -95,6 +95,78 @@ class ChromeControllerTests(unittest.TestCase):
         self.assertEqual(result, project_url)
         self.assertEqual(visit.call_count, 2)
 
+    def test_comment_task_posts_comment_instead_of_like(self):
+        control = RunControl()
+        control.sleep = Mock()
+        controller = ChromeController(AppConfig(), control, Mock(), Mock())
+        controller.driver = Mock()
+        project_url = "https://www.behance.net/gallery/1/Project"
+        controller.driver.current_url = project_url
+        with (
+            patch.object(controller, "_resolve_to_project", return_value=project_url),
+            patch.object(controller, "_navigate"),
+            patch.object(controller, "_post_comment", return_value=True) as post,
+            patch.object(controller, "_appreciate") as appreciate,
+        ):
+            self.assertTrue(controller.perform_comment_task([project_url]))
+        post.assert_called_once_with()
+        appreciate.assert_not_called()
+
+    def test_like_task_still_uses_appreciate(self):
+        control = RunControl()
+        control.sleep = Mock()
+        controller = ChromeController(AppConfig(), control, Mock(), Mock())
+        controller.driver = Mock()
+        project_url = "https://www.behance.net/gallery/1/Project"
+        controller.driver.current_url = project_url
+        with (
+            patch.object(controller, "_resolve_to_project", return_value=project_url),
+            patch.object(controller, "_navigate"),
+            patch.object(controller, "_post_comment") as post,
+            patch.object(controller, "_appreciate", return_value=True) as appreciate,
+        ):
+            self.assertTrue(controller.perform_task([project_url]))
+        appreciate.assert_called_once_with()
+        post.assert_not_called()
+
+    def test_reloads_page_until_comment_field_appears(self):
+        control = RunControl()
+        control.sleep = Mock()
+        control.checkpoint = Mock()
+        controller = ChromeController(AppConfig(), control, Mock(), Mock())
+        controller.driver = Mock()
+        field = Mock()
+        with (
+            patch.object(controller, "_scroll_to_comments"),
+            patch.object(
+                controller, "_find_comment_field", side_effect=[None, None, field]
+            ),
+            patch.object(controller, "_click_comments_opener", return_value=False),
+            patch.object(controller, "_reload_page") as reload_page,
+        ):
+            self.assertIs(controller._wait_for_comment_field(), field)
+        self.assertEqual(reload_page.call_count, 2)
+
+    def test_prefers_project_comment_textarea_over_other_textareas(self):
+        other = Mock()
+        other.get_attribute.return_value = "TextArea-input-AAA TextArea-textarea"
+        other.is_displayed.return_value = True
+        comment = Mock()
+        comment.get_attribute.return_value = (
+            "TextArea-input-GZ6 ProjectCommentInput-commentTextArea-Vcg "
+            "TextArea-textarea"
+        )
+        comment.is_displayed.return_value = True
+        hidden = Mock()
+        hidden.get_attribute.return_value = (
+            "ProjectCommentInput-commentTextArea-OLD TextArea-textarea"
+        )
+        hidden.is_displayed.return_value = False
+        self.assertIs(
+            ChromeController._prefer_comment_field([other, hidden, comment]),
+            comment,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

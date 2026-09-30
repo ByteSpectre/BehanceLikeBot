@@ -36,12 +36,12 @@ if errorlevel 1 goto :error
 
 copy /y "PORTABLE_README.txt" "release\dist\BehancerBot\README.txt" >nul
 powershell -NoProfile -Command ^
-    "Compress-Archive -Path 'release\dist\BehancerBot\*' -DestinationPath 'release\BehancerBot-portable-v1.5.2.zip' -Force"
+    "Compress-Archive -Path 'release\dist\BehancerBot\*' -DestinationPath 'release\BehancerBot-portable-v1.6.0.zip' -Force"
 if errorlevel 1 goto :error
 
 echo.
 echo Build completed:
-echo release\BehancerBot-portable-v1.5.2.zip
+echo release\BehancerBot-portable-v1.6.0.zip
 exit /b 0
 
 :error
